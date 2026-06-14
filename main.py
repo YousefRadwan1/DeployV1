@@ -1,5 +1,4 @@
 import os
-import io
 import logging
 import tempfile
 
@@ -18,12 +17,118 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn.error")
 
 # ===== Config =====
-# Uses path relative to this file — works on Windows, Linux, Docker
-MODEL_PATH = "Final_best_model.pth"
+MODEL_PATH = os.path.join(tempfile.gettempdir(), "Final_best_model.pth")
+GDRIVE_FILE_ID = "1lZOWFBteOX9HnE4B82RMTbmLp46-mPhp"
 NUM_CLASSES = 2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = None
+
+
+# ===== Google Drive Downloader =====
+def download_from_gdrive(file_id: str, dest_path: str):
+    """
+    Download a large file from Google Drive.
+    Tries multiple URL strategies to handle Google's anti-scraping measures.
+    """
+    import re
+    import requests
+
+    logger.info(f"Downloading model from Google Drive (id={file_id})...")
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    })
+
+    def stream_to_disk(response) -> float:
+        """Write streamed response to disk, return size in MB."""
+        total_bytes = 0
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    total_bytes += len(chunk)
+        return total_bytes / (1024 * 1024)
+
+    def is_html(response) -> bool:
+        ct = response.headers.get("Content-Type", "")
+        return "text/html" in ct
+
+    # ── Strategy 1: drive.google.com/uc with confirm=t (2024+ trick) ──
+    logger.info("Trying strategy 1: uc?confirm=t ...")
+    try:
+        r = session.get(
+            "https://drive.google.com/uc",
+            params={"export": "download", "id": file_id, "confirm": "t"},
+            stream=True,
+            timeout=300,
+        )
+        r.raise_for_status()
+        if not is_html(r):
+            size_mb = stream_to_disk(r)
+            if size_mb >= 1.0:
+                logger.info(f"Strategy 1 success: {size_mb:.1f} MB")
+                return
+    except Exception as e:
+        logger.warning(f"Strategy 1 failed: {e}")
+
+    # ── Strategy 2: drive.usercontent.google.com (newer endpoint) ──
+    logger.info("Trying strategy 2: drive.usercontent.google.com ...")
+    try:
+        r = session.get(
+            "https://drive.usercontent.google.com/download",
+            params={"id": file_id, "export": "download", "confirm": "t"},
+            stream=True,
+            timeout=300,
+        )
+        r.raise_for_status()
+        if not is_html(r):
+            size_mb = stream_to_disk(r)
+            if size_mb >= 1.0:
+                logger.info(f"Strategy 2 success: {size_mb:.1f} MB")
+                return
+    except Exception as e:
+        logger.warning(f"Strategy 2 failed: {e}")
+
+    # ── Strategy 3: fetch page, extract real download URL from HTML ──
+    logger.info("Trying strategy 3: parse HTML for download URL ...")
+    try:
+        page = session.get(
+            f"https://drive.google.com/file/d/{file_id}/view",
+            timeout=30,
+        )
+        # Find the direct download link embedded in the page
+        match = re.search(
+            r'https://drive\.usercontent\.google\.com/download[^"\'<>\s]+',
+            page.text
+        )
+        if not match:
+            match = re.search(
+                r'"downloadUrl":"([^"]+)"',
+                page.text
+            )
+        if match:
+            dl_url = match.group(0).replace("\\u003d", "=").replace("\\u0026", "&")
+            r = session.get(dl_url, stream=True, timeout=300)
+            r.raise_for_status()
+            if not is_html(r):
+                size_mb = stream_to_disk(r)
+                if size_mb >= 1.0:
+                    logger.info(f"Strategy 3 success: {size_mb:.1f} MB")
+                    return
+    except Exception as e:
+        logger.warning(f"Strategy 3 failed: {e}")
+
+    # ── All strategies failed ──
+    if os.path.exists(dest_path):
+        os.remove(dest_path)
+    raise RuntimeError(
+        "All Google Drive download strategies failed.\n"
+        "Please verify:\n"
+        "  1. The file is shared as 'Anyone with the link can view'\n"
+        "  2. The file ID is correct: " + file_id
+    )
 
 
 # ===== Model Loading (lifespan) =====
@@ -31,12 +136,14 @@ model = None
 async def lifespan(app: FastAPI):
     global model
 
-    # Fail fast with a clear error if the model file is missing
+    # Download model if not already cached
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"Model file not found at: {MODEL_PATH}\n"
-            "Make sure 'Final_best_model.pth' is in the same directory as main.py."
-        )
+        try:
+            download_from_gdrive(GDRIVE_FILE_ID, MODEL_PATH)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download model: {e}")
+    else:
+        logger.info(f"Using cached model at {MODEL_PATH}")
 
     logger.info(f"Loading model from {MODEL_PATH} on device: {device}")
 
@@ -148,6 +255,8 @@ async def health_check():
         "status": "healthy",
         "model_loaded": model is not None,
         "device": str(device),
+        "model_path": MODEL_PATH,
+        "model_cached": os.path.exists(MODEL_PATH),
     }
 
 
@@ -188,4 +297,4 @@ async def process_video(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
