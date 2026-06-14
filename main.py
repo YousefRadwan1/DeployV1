@@ -19,7 +19,7 @@ logger = logging.getLogger("uvicorn.error")
 
 # ===== Config =====
 # Uses path relative to this file — works on Windows, Linux, Docker
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "Final_best_model.pth")
+MODEL_PATH = "Final_best_model.pth"
 NUM_CLASSES = 2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
